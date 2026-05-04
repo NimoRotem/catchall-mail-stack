@@ -1,0 +1,10 @@
+dkim_private.key
+dkim_public.txt
+*.key
+*.pem
+.env
+.env.*
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
