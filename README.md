@@ -251,3 +251,36 @@ The web UI uses these endpoints; you can hit them yourself with the auth cookie.
 ## License
 
 MIT — see `LICENSE`.
+
+## Inbound spam filtering
+
+A catchall mailbox accepts **all** mail for its domain and forwards it onward
+(`MAIL_FORWARD_TO`, or sibling tenants). If that inbound is spam, forwarding it
+re-sends it **from your own domain** (aligned DKIM) — which makes your domain
+look like a spammer to Gmail and poisons the sending reputation you rely on for
+real mail. `spamfilter.py` scores inbound mail and **refuses to forward the
+spam** (a copy is still kept, flagged `is_spam`, so nothing is lost).
+
+**Signals (dependency-light — dnspython + dkimpy only):**
+- IP blocklists (Spamhaus ZEN, Barracuda, SpamCop) on the connecting IP
+- DKIM verification + a best-effort SPF check
+- Content heuristics (sextortion / crypto-extortion / lottery / phishing /
+  pharma / SEO), shouty subjects, brand-name display spoofing, URL shorteners,
+  risky attachments, suspicious TLDs
+
+**Fail-open by design:** any scoring error classifies the message as *ham*, so a
+bug can never drop a legitimate email.
+
+**Config (env):**
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `SPAM_FILTER` | `1` | master on/off |
+| `SPAM_THRESHOLD` | `6` | score at/above which mail is spam |
+| `SPAM_DNSBL` | `1` | enable IP blocklist lookups |
+| `SPAM_ALLOW_DOMAINS` | *(your own domains)* | never-spam sender domains |
+| `SPAM_BLOCK_DOMAINS` | *(empty)* | always-spam sender domains |
+| `MAIL_OWN_DOMAINS` | *(empty)* | your domains (allowlisted + used for spoof detection) |
+
+Spam is hidden from the inbox and viewable at `?folder=spam`. The DB gains
+`is_spam` / `spam_score` / `spam_reasons` columns (auto-migrated on startup).

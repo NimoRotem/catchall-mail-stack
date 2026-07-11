@@ -48,6 +48,17 @@ BRAND = os.environ.get("MAIL_BRAND", "Nebula Mail")
 COOKIE_NAME = os.environ.get("MAIL_COOKIE", "nebula_mail_auth")
 DB_DSN = os.environ.get("MAIL_DB_DSN", "postgresql://nimrod_rotem@/nebulamail")
 FORWARD_TO = os.environ.get("MAIL_FORWARD_TO", "")
+try:
+    import spamfilter as _spamfilter
+except Exception:
+    _spamfilter = None
+SPAM_FILTER_ENABLED = os.environ.get("SPAM_FILTER", "1") != "0" and _spamfilter is not None
+SPAM_THRESHOLD = float(os.environ.get("SPAM_THRESHOLD", "6") or 6)
+SPAM_USE_DNSBL = os.environ.get("SPAM_DNSBL", "1") != "0"
+SPAM_ALLOW_DOMAINS = {d.strip().lower() for d in os.environ.get("SPAM_ALLOW_DOMAINS",
+    "grabo.com,nemopowertools.com,grabo.cc,lisa.my,alphabell.com,rotem.ai,rotem.cc,nebula-bio.com").split(",") if d.strip()}
+SPAM_BLOCK_DOMAINS = {d.strip().lower() for d in os.environ.get("SPAM_BLOCK_DOMAINS", "").split(",") if d.strip()}
+SPAM_OWN_DOMAINS = {DOMAIN.lower()} | {d.strip().lower() for d in os.environ.get("MAIL_OWN_DOMAINS", "").split(",") if d.strip()}
 
 DKIM_SELECTOR = os.environ.get("DKIM_SELECTOR", "mail")
 DKIM_KEY_PATH = Path(os.environ.get("DKIM_KEY", str(Path(__file__).parent / "dkim_private.key")))
@@ -82,6 +93,14 @@ async def init_db():
     global pool
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=2, max_size=10)
     log.info("Database pool initialized")
+    try:
+        async with pool.acquire() as _c:
+            await _c.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS is_spam BOOLEAN DEFAULT FALSE")
+            await _c.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS spam_score REAL")
+            await _c.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS spam_reasons TEXT")
+            await _c.execute("CREATE INDEX IF NOT EXISTS idx_emails_spam ON emails(is_spam)")
+    except Exception as _e:
+        log.warning(f"spam migration skipped: {_e}")
 
 
 async def store_email(direction, envelope_from, envelope_to, raw_bytes):
@@ -305,7 +324,8 @@ class CatchallHandler:
             # Locally store mail for our own domain
             if local_rcpts:
                 future = asyncio.run_coroutine_threadsafe(
-                    _process_inbound(raw, envelope.mail_from, local_rcpts[0]), main_loop
+                    _process_inbound(raw, envelope.mail_from, local_rcpts[0],
+                        peer_ip=(session.peer[0] if getattr(session, "peer", None) else None)), main_loop
                 )
                 future.result(timeout=30)
 
@@ -315,10 +335,31 @@ class CatchallHandler:
             return "451 Temporary error, please retry"
 
 
-async def _process_inbound(raw: bytes, mail_from: str, to_addr: str):
+async def _process_inbound(raw: bytes, mail_from: str, to_addr: str, peer_ip: str = None):
     """Process inbound email on the main event loop."""
+    _spam = None
+    if SPAM_FILTER_ENABLED:
+        try:
+            _loop = asyncio.get_running_loop()
+            _spam = await _loop.run_in_executor(None, lambda: _spamfilter.score_message(
+                raw, mail_from=mail_from or "", peer_ip=peer_ip,
+                our_domains=SPAM_OWN_DOMAINS, allow_domains=SPAM_ALLOW_DOMAINS,
+                block_domains=SPAM_BLOCK_DOMAINS, threshold=SPAM_THRESHOLD,
+                use_dnsbl=SPAM_USE_DNSBL))
+        except Exception as _e:
+            log.warning(f"spam scoring failed (fail-open): {_e}")
+    _is_spam = bool(_spam and _spam.is_spam)
     email_id = await store_email("inbound", mail_from, to_addr, raw)
-    asyncio.create_task(forward_to_gmail(email_id, raw))
+    if _is_spam:
+        try:
+            async with pool.acquire() as _c:
+                await _c.execute("UPDATE emails SET is_spam=TRUE, spam_score=$1, spam_reasons=$2 WHERE id=$3",
+                                 float(_spam.score), (",".join(_spam.reasons))[:500], email_id)
+        except Exception as _e:
+            log.warning(f"spam flag update failed: {_e}")
+        log.info(f"SPAM inbound from={mail_from} ip={peer_ip} score={_spam.score} reasons={_spam.reasons} — stored, NOT forwarding")
+    else:
+        asyncio.create_task(forward_to_gmail(email_id, raw))
 
 
 # ---------------------------------------------------------------------------
